@@ -203,6 +203,8 @@ class Args:
     """Save head+wrist PNG snapshots every N ticks. None disables."""
     summary_file: pathlib.Path | None = pathlib.Path("./task_times_r1lite_closedloop.jsonl")
     """Append one per-task summary (total inference time + total wall time) when the run ends."""
+    fd_log_dir: pathlib.Path | None = None
+    """Optional bounded failure-detection event capture; no images or action chunks are saved."""
 
 
 # ─── main ───────────────────────────────────────────────────────────────────
@@ -217,10 +219,36 @@ def main(args: Args) -> None:
           f"(/hdas/camera_head/left_raw/image_raw_color/compressed)")
     env: RobotEnv | None = None
 
+    # Import/start capture only when explicitly enabled. Keep legacy I/O unchanged.
+    fd = None
+    fd_reason = "unknown"
+    fd_exception = None
+    fd_exception_stage = None
+    if args.fd_log_dir is not None:
+        try:
+            from fd_client_capture import Capture
+
+            fd = Capture(args.fd_log_dir, entry_path=__file__, parameters={
+                "env": args.env.value,
+                "hz": args.hz,
+                "max_steps": args.max_steps,
+                "dry_run": args.dry_run,
+                "log_every": args.log_every,
+                "save_images_every": args.save_images_every,
+                "control_mode": CONTROL_MODE,
+            })
+        except Exception as e:
+            # Never expose exception text (paths/URLs can contain credentials).
+            logger.warning("FD capture unavailable (%s); capture is incomplete", type(e).__name__)
+
     try:
         # 1. Robot env
+        if fd is not None:
+            fd.stage = "robot_init"
         print("Initializing robot environment (ROS2)...")
         env = RobotEnv()
+        if fd is not None:
+            fd.stage = "initialization_wait"
         time.sleep(2)
         print("Initialization complete.")
 
@@ -234,6 +262,8 @@ def main(args: Args) -> None:
             print("🟢 " * 25 + "\n")
 
         # 2. Connect to inference server (ONCE, reused for all control ticks).
+        if fd is not None:
+            fd.stage = "connect"
         print(f"Connecting to inference server at {args.host}:{args.port}...")
         try:
             policy = _websocket_client_policy.WebsocketClientPolicy(
@@ -243,21 +273,36 @@ def main(args: Args) -> None:
             )
             logger.info(f"Server metadata: {policy.get_server_metadata()}")
         except requests.exceptions.RequestException as e:
+            fd_reason, fd_exception = "connect_error", e
+            if fd is not None:
+                fd_exception_stage = fd.stage
             print(f"Error connecting to server: {e}")
             return
 
         # 3. Warm up once with the current observation (load model, jit etc.).
+        if fd is not None:
+            fd.stage = "warmup_observation"
         print("Warmup (2 queries)...")
         warm_obs, _ = _build_obs(env, save_image_dir=None)
         if warm_obs is None:
+            fd_reason = "initial_observation_missing"
+            if fd is not None:
+                fd.event("observation_skipped", phase="warmup", reason="invalid_observation")
             print("Could not read initial observation; aborting.")
             return
+        if fd is not None:
+            fd.source_observation()
         for _ in range(2):
-            policy.infer(warm_obs)
+            if fd is None:
+                policy.infer(warm_obs)
+            else:
+                fd.infer(policy, warm_obs, phase="warmup", warmup_index=_)
 
         # 4. Episode bookkeeping: one script run == one episode. The index is
         #    derived from what's already in the log, so repeated runs appending
         #    to the same file stay separable without any manual bookkeeping.
+        if fd is not None:
+            fd.stage = "episode_bookkeeping"
         episode_index = next_episode_index(args.log_file)
         episode_id = f"{args.policy_name}-{ts_start.strftime('%Y%m%d_%H%M%S')}"
         if args.log_file is not None:
@@ -293,6 +338,9 @@ def main(args: Args) -> None:
         stop_reason = "unknown"
         try:
             while True:
+                if fd is not None:
+                    fd.begin_control_tick(step)
+                    fd.stage = "tick_wait"
                 # Wait for the next tick (skip if we already overran).
                 now = time.time()
                 slack = next_tick - now
@@ -310,20 +358,33 @@ def main(args: Args) -> None:
                     if args.save_images_every and step % args.save_images_every == 0
                     else None
                 )
+                if fd is not None:
+                    fd.stage = "control_observation"
                 obs, r_ee_xyz = _build_obs(env, save_image_dir=save_dir)
                 if obs is None:
+                    if fd is not None:
+                        fd.event("observation_skipped", reason="invalid_observation")
                     if step % 15 == 0:
                         print("  [skip] no observation this tick")
                     continue
+                if fd is not None:
+                    fd.source_observation()
 
                 # Single inference, single action consumed.
                 t0 = time.perf_counter()
-                result = policy.infer(obs)
+                if fd is None:
+                    result = policy.infer(obs)
+                else:
+                    result = fd.infer(policy, obs, phase="control")
                 infer_ms = (time.perf_counter() - t0) * 1000.0
                 infer_times_ms.append(infer_ms)
 
+                if fd is not None:
+                    fd.stage = "action_decode"
                 actions = np.asarray(result.get("actions", []))
                 if actions.size == 0:
+                    if fd is not None:
+                        fd.event("action_skipped", reason="empty_actions")
                     if step % 15 == 0:
                         print("  [skip] empty action chunk")
                     continue
@@ -334,13 +395,23 @@ def main(args: Args) -> None:
                 if not args.dry_run:
                     t1 = time.perf_counter()
                     if CONTROL_MODE == "joint":
-                        env.control(action_first.tolist())
+                        if fd is None:
+                            env.control(action_first.tolist())
+                        else:
+                            fd.control(env.control, action_first.tolist())
                     elif CONTROL_MODE == "eepose":
-                        env.control_eef(action_first.tolist())
+                        if fd is None:
+                            env.control_eef(action_first.tolist())
+                        else:
+                            fd.control(env.control_eef, action_first.tolist())
                     exec_ms = (time.perf_counter() - t1) * 1000.0
                     exec_times_ms.append(exec_ms)
+                elif fd is not None:
+                    fd.event("action_skipped", reason="dry_run", row_index=0)
 
                 # Periodic status print.
+                if fd is not None:
+                    fd.stage = "status_print"
                 if step % int(max(1, args.hz)) == 0:  # ≈ 1 line/sec
                     r_arm = action_first[7:13]
                     r_grip = action_first[13]
@@ -350,6 +421,8 @@ def main(args: Args) -> None:
                           f"infer={infer_ms:5.1f}ms (avg {mean_infer:5.1f}ms)")
 
                 # Periodic jsonl logging.
+                if fd is not None:
+                    fd.stage = "legacy_logging"
                 if args.log_file is not None and step % args.log_every == 0:
                     append_jsonl(args.log_file, {
                         "type": "step",
@@ -369,14 +442,20 @@ def main(args: Args) -> None:
                 step += 1
                 if args.max_steps is not None and step >= args.max_steps:
                     stop_reason = "max_steps"
+                    fd_reason = "max_steps"
                     print(f"\nReached --max-steps={args.max_steps}; stopping.")
                     break
 
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as e:
             stop_reason = "ctrl_c"
+            fd_reason, fd_exception = "ctrl_c", e
+            if fd is not None:
+                fd_exception_stage = fd.stage
             print("\nInterrupted by user.")
 
         # Final summary + per-task timing record.
+        if fd is not None:
+            fd.stage = "legacy_summary"
         t_end = time.perf_counter()
         infer_s_total = float(np.sum(infer_times_ms)) / 1000.0   # Σ of all policy.infer() calls
         exec_s_total = float(np.sum(exec_times_ms)) / 1000.0     # Σ of all env.control() calls
@@ -434,9 +513,22 @@ def main(args: Args) -> None:
             print(f"  → appended task summary to {args.summary_file}")
 
     except Exception as e:
+        fd_reason, fd_exception = "exception", e
+        if fd is not None:
+            fd_exception_stage = fd.stage
         print(f"\nUnexpected error: {e}")
         raise
+    except BaseException as e:
+        # Pre-loop/summary interrupts must still propagate, as in the original.
+        fd_reason = "ctrl_c" if isinstance(e, KeyboardInterrupt) else "base_exception"
+        fd_exception = e
+        if fd is not None:
+            fd_exception_stage = fd.stage
+        raise
     finally:
+        if fd is not None:
+            fd.finish(fd_reason, exception=fd_exception, exception_stage=fd_exception_stage,
+                      legacy_step=locals().get("step"))
         print("Program finished.")
 
 

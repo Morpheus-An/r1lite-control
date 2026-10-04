@@ -187,7 +187,27 @@ class ResizeImages(DataTransformFn):
     width: int
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        # Validate that the image dict exists and contains valid arrays. Provide
+        # a clearer error message which includes the offending key to help
+        # debugging when a None value or other unexpected value is passed.
+        if "image" not in data:
+            raise KeyError("ResizeImages transform expected key 'image' in data but it was not found")
+
+        images = data["image"]
+        if not isinstance(images, dict):
+            raise TypeError(f"ResizeImages expected data['image'] to be a dict mapping names->arrays, got {type(images)}")
+
+        new_images: dict = {}
+        for k, v in images.items():
+            if v is None:
+                raise ValueError(f"ResizeImages received None for image key '{k}'")
+            try:
+                new_images[k] = image_tools.resize_with_pad(v, self.height, self.width)
+            except Exception as e:
+                # Include the key name to make it easy to see which camera caused the problem.
+                raise RuntimeError(f"Error resizing image for key '{k}': {e}") from e
+
+        data["image"] = new_images
         return data
 
 

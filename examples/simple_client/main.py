@@ -30,6 +30,7 @@ class Args:
 
     # Host and port to connect to the server.
     host: str = "192.168.31.160"
+    # host: str = "10.42.0.1"
     # Port to connect to the server. If None, the server will use the default port.
     port: int | None = 8000
     # API key to use for the server.

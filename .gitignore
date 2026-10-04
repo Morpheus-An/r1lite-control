@@ -167,3 +167,21 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# --- R1-Lite deployment box: large runtime artifacts (kept local, not uploaded) ---
+# Local virtualenv living in the repo root
+/openpi/
+# Camera frame dumps from closed-loop runs (GBs)
+log_images_*/
+examples/simple_client/log_images_*/
+# Raw per-step action logs (tens of MB each)
+log_actions_r1lite*.jsonl
+examples/simple_client/log_actions_r1lite*.jsonl
+# Oversized eval replay logs (the smaller eval_*/times_* jsonl are kept)
+examples/simple_client/eval_fm_dit.jsonl
+examples/simple_client/eval_policyA.jsonl
+examples/simple_client/eval_policy_mars_star.jsonl
+# fd_client capture sessions (~60MB of per-step events)
+/fd_client_logs/
+# Accidental shell-redirect artifact
+examples/simple_client/, json.load*

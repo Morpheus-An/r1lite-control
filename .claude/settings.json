@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile main_r1lite_closedloop.py)",
+      "Skill(dataviz)",
+      "Skill(dataviz:*)",
+      "Bash(python -c \"import matplotlib; print\\(matplotlib.__version__\\)\")",
+      "Bash(python -)",
+      "Bash(node scripts/validate_palette.js \"#0072B2,#E69F00,#009E73\" --mode light)",
+      "Bash(python /tmp/claude-1000/-home-r1lite-ant-openpi-r1lite/1204554e-7eaa-473b-8cdd-929e06fbb9b9/scratchpad/plot_r_ee.py)",
+      "Bash(python /tmp/claude-1000/-home-r1lite-ant-openpi-r1lite/1204554e-7eaa-473b-8cdd-929e06fbb9b9/scratchpad/plot_r_ee_compare.py)",
+      "Bash(grep -vE \"\\\\.so|\\\\.a$\")"
+    ],
+    "additionalDirectories": [
+      "/tmp/claude-1000/-home-r1lite-ant-openpi-r1lite/1204554e-7eaa-473b-8cdd-929e06fbb9b9/scratchpad"
+    ]
+  }
+}

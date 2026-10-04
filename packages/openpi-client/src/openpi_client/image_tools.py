@@ -24,7 +24,17 @@ def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BI
     Returns:
         The resized images in [..., height, width, channel].
     """
+    # Basic validation to provide a clearer error when callers pass None or
+    # an unexpected type/shape.
+    if images is None:
+        raise ValueError("resize_with_pad received 'images=None' (expected a numpy array)")
+    if not isinstance(images, np.ndarray):
+        raise TypeError(f"resize_with_pad expected a numpy.ndarray for images, got {type(images)}")
+
     # If the images are already the correct size, return them as is.
+    # We expect the array to have at least 3 trailing dimensions (h, w, c).
+    if images.ndim < 3:
+        raise ValueError(f"resize_with_pad expected images with at least 3 dimensions (h,w,c), got shape {images.shape}")
     if images.shape[-3:-1] == (height, width):
         return images
 

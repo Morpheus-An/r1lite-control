@@ -15,8 +15,10 @@ from rclpy.qos import qos_profile_sensor_data
 TOPIC_MAP = {
     "/hdas/camera_head/left_raw/image_raw_color/compressed": "image_left",
     "/hdas/camera_head/right_raw/image_raw_color/compressed": "image_right",
-    "/hdas/camera_wrist_left/color/image_rect_raw/compressed":  "image_left_wrist",
-    "/hdas/camera_wrist_right/color/image_rect_raw/compressed":  "image_right_wrist"
+    "/hdas/camera_wrist_left/color/image_raw/compressed":  "image_left_wrist",
+    "/hdas/camera_wrist_right/color/image_raw/compressed":  "image_right_wrist"
+    # "/hdas/camera_wrist_left/color/image_rect_raw/compressed":  "image_left_wrist",
+    # "/hdas/camera_wrist_right/color/image_rect_raw/compressed":  "image_right_wrist"
 }
 
 qos_pub_profile = rclpy.qos.QoSProfile(
@@ -98,8 +100,10 @@ class DualArmStateReader(Node):
         image_topics = [
             "/hdas/camera_head/left_raw/image_raw_color/compressed",
             "/hdas/camera_head/right_raw/image_raw_color/compressed",
-            "/hdas/camera_wrist_left/color/image_rect_raw/compressed",
-            "/hdas/camera_wrist_right/color/image_rect_raw/compressed"
+            "/hdas/camera_wrist_left/color/image_raw/compressed",
+            "/hdas/camera_wrist_right/color/image_raw/compressed"
+            # "/hdas/camera_wrist_left/color/image_rect_raw/compressed",
+            # "/hdas/camera_wrist_right/color/image_rect_raw/compressed"
         ]
         
         for topic in image_topics:
@@ -186,8 +190,10 @@ class DualArmStateReader(Node):
         image_topics = [
             "/hdas/camera_head/left_raw/image_raw_color/compressed",
             "/hdas/camera_head/right_raw/image_raw_color/compressed",
-            "/hdas/camera_wrist_left/color/image_rect_raw/compressed",
-            "/hdas/camera_wrist_right/color/image_rect_raw/compressed"
+            "/hdas/camera_wrist_left/color/image_raw/compressed",
+            "/hdas/camera_wrist_right/color/image_raw/compressed"
+            # "/hdas/camera_wrist_left/color/image_rect_raw/compressed",
+            # "/hdas/camera_wrist_right/color/image_rect_raw/compressed"
         ]
         
         for topic in image_topics:
@@ -196,7 +202,22 @@ class DualArmStateReader(Node):
         return images
     
     def get_joint_states(self) -> Optional[List[float]]:
-        """获取所有关节状态"""
+        """Full 14-D proprioception: [L1..L6, L_grip, R1..R6, R_grip].
+
+        Fixed 2026-09-16. Previously this overwrote ``joint_*[-1]`` with the gripper
+        value and returned a 12-D **right-first** vector ``[R1..R5, R_grip, L1..L5,
+        L_grip]``, which destroyed the 6th joint of each arm. The clients' 12->14
+        expanders then zero-filled that slot, so the policy received R6 == 0.0 on
+        every single tick. Training data records R6 from the raw
+        ``/hdas/feedback_arm_right.position[5]`` topic, where it is the second most
+        active arm joint (std 0.212 rad, range -0.363..+0.544), so wiping it at
+        deploy time produces an out-of-distribution state and the policy's
+        right-arm / gripper outputs oscillate near the grasp.
+
+        The layout now matches ``RobotEnv.control()``, which has always expected
+        ``[L1-L6(0-5), L_grip(6), R1-R6(7-12), R_grip(13)]``. Every client keeps a
+        ``len(qpos) == 14`` pass-through branch, so they all see the real joint.
+        """
         joint_left = self.get_latest_joint_state("/hdas/feedback_arm_left")
         gripper_left = self.get_latest_joint_state('/hdas/feedback_gripper_left')
         
@@ -205,17 +226,33 @@ class DualArmStateReader(Node):
         
         if joint_left is None or gripper_left is None or joint_right is None or gripper_right is None:
             return None
-        
-        joint_left[-1] = gripper_left[0]
-        joint_right[-1] = gripper_right[0]
-        
-        joint_final = joint_right
-        joint_final.extend(joint_left)
-        
-        return joint_final
+
+        # A short arm vector would silently shift the gripper out of its slot; the
+        # whole point of this fix is that such corruption must not pass unnoticed.
+        if len(joint_left) != 6 or len(joint_right) != 6:
+            raise RuntimeError(
+                f"expected 6 joints per arm from /hdas/feedback_arm_*, got "
+                f"left={len(joint_left)} right={len(joint_right)} — driver layout changed"
+            )
+
+        return list(joint_left) + [gripper_left[0]] + list(joint_right) + [gripper_right[0]]
     
     def get_eef_poses(self) -> Optional[List[float]]:
-        """获取所有末端执行器位姿"""
+        """16-D EE poses, **right arm first**:
+        ``[R_xyz(0:3), R_quat(3:7), R_grip(7), L_xyz(8:11), L_quat(11:15), L_grip(15)]``.
+
+        KNOWN TECH DEBT (2026-09-16): this accessor is right-first while
+        ``get_joint_states()`` above is left-first — the two disagree on arm order.
+        Deliberately left as-is: the deployed policy is joint-space, its ``agent_pos``
+        carries no EE pose, so the inconsistency has no effect on the current
+        evaluation, and changing a cross-file convention mid-evaluation would add an
+        unverified variable. Clients rely on the right-first order here
+        (``main_r1lite_closedloop.py`` reads ``eef_pose[0:3]`` as the right EE).
+
+        To unify later: flip this to left-first AND update every consumer, including
+        the upstream side that records ``r_ee_xyz``. This becomes a blocker the moment
+        the upstream policy switches to EE-space.
+        """
         ee_left = self.get_latest_pose("/motion_control/pose_ee_arm_left")
         gripper_left = self.get_latest_joint_state('/hdas/feedback_gripper_left')
         
@@ -387,7 +424,8 @@ class RobotEnv:
             raise RuntimeError("Arm not initialised; pass arm_ip when constructing RobotEnv.")
 
         torso_joint = [-0.8278999924659729, 1.7697999477386475, 0.3725000023841858, 0.0]
-        self._arm.send_joint_commands(action[7:13], action[:6], torso_joint, action[13], action[6])
+        # action format: [L1-L6(0-5), L_grip(6), R1-R6(7-12), R_grip(13)]
+        self._arm.send_joint_commands(action[0:6], action[7:13], torso_joint, action[6], action[13])
     
     def control_eef(self, action, wait=True):
         """控制末端执行器"""
@@ -395,7 +433,8 @@ class RobotEnv:
             raise RuntimeError("Arm not initialised")
             
         torso_joint = [-0.8295000195503235, 1.7687000036239624, 0.373199999332428, 0.0]
-        self._arm.send_eef_commands(action[8:15], action[:7], torso_joint, action[15], action[7])
+        # action format: [L_ee(0-6), L_grip(7), R_ee(8-14), R_grip(15)]
+        self._arm.send_eef_commands(action[0:7], action[8:15], torso_joint, action[7], action[15])
         
         if wait:
             time.sleep(0.01)

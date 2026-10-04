@@ -76,7 +76,8 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     ),
     EnvMode.R1LITE: Checkpoint(
         config="pi05_r1lite",
-        dir="gs://openpi-assets/checkpoints/pi05_base",
+        # dir="gs://openpi-assets/checkpoints/pi05_base",
+        dir="/home/ntu/lpf/r1lite_noema_20000step_adamw_lr8e6/10000",
     ),
 }
 
